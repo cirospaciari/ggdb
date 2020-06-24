@@ -1,4 +1,4 @@
-[![npm package](https://nodei.co/npm/ggdb.png?downloads=true&downloadRank=true?maxAge=30)](https://nodei.co/npm/ggdb/)
+[![npm package](https://nodei.co/npm/ggdb.png?downloads=true&downloadRank=true?maxAge=30)](https://nodei.co/npm/jscomet/)
 
 [![NPM version](https://img.shields.io/npm/v/ggdb.svg)](https://img.shields.io/npm/v/ggdb.svg) [![NPM License](https://img.shields.io/npm/l/ggdb.svg)](https://img.shields.io/npm/l/ggdb.svg) [![Downloads](https://img.shields.io/npm/dt/ggdb.svg?maxAge=43200)](https://img.shields.io/npm/dt/ggdb.svg?maxAge=60) [![ISSUES](https://img.shields.io/github/issues/cirospaciari/ggdb.svg?maxAge=60)](https://img.shields.io/github/issues/cirospaciari/ggdb.svg?maxAge=60)
 
