@@ -1,0 +1,34 @@
+{
+  "name": "ggdb",
+  "version": "0.0.1",
+  "description": "Simple but powerful JSON database with index and sequences capabilities, recommended for up to 1 million of registers per file/collection.",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cirospaciari/ggdb.git"
+  },
+  "keywords": [
+    "json",
+    "db",
+    "index",
+    "indexed",
+    "database",
+    "simple",
+    "ggdb"
+  ],
+  "contributors": [
+    {
+      "name": "Ciro César Martins Spaciari Jr",
+      "email": "ciro.spaciari@gmail.com"
+    }
+  ],
+  "author": "Ciro César Martins Spaciari Jr",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/cirospaciari/ggdb/issues"
+  },
+  "homepage": "https://github.com/cirospaciari/ggdb#readme"
+}
