@@ -2,11 +2,13 @@ class IndexEntry {
 
     static load(buffer, offset, start) {
         offset = offset || 0;
+       
         const entry = {
             type: 5,
             start: start,
-            property: buffer.toString('utf8', 1 + offset, offset + 255).replace(/\0/g, '').split(';'),
-            size: buffer.readUInt32BE(256 + offset)
+            property: buffer.toString('utf8', offset + 1, offset + 255).replace(/\0/g, '').split(';'),
+            size: buffer.readUInt32BE(256 + offset),
+            next: buffer.readBigUInt64BE(260 + offset)
         };
         return entry;
     }
@@ -41,7 +43,7 @@ class IndexEntry {
         return 21;
     }
     static getBufferSize() {
-        return 260;
+        return 268;
     }
 
     static async createBucket(write, index){
@@ -71,6 +73,7 @@ class IndexEntry {
             entry.buffer = Buffer.alloc(Number(entry.size));//alloc entries buffer
             await read(entry.buffer, 0, Number(entry.size), Number(entry.start) + headerSize);
         }
+        
         /*
          * 4 bytes hash
          * 8 bytes position  (0 if its a free position)
@@ -79,6 +82,7 @@ class IndexEntry {
         if(!entry.entries){
             entry.entries = new Array(entry.size / 20);
         }
+        
          for(let i = 0; i < entry.size; i += 20){ //20 bytes
             entry.entries[i / 20] = {
                 hash: entry.buffer.readUInt32BE(i),
@@ -106,19 +110,22 @@ class IndexEntry {
         return write(index.buffer, 0, Number(index.size), Number(index.start) +  headerSize);
     }
 
-    static save(buffer, offset, start, properties, size) {
+    static save(buffer, offset, start, properties, size, next) {
 
         buffer.writeUInt8(5, offset); //type
         let property = properties.join(';');
         property += '\0'.repeat(255 - Buffer.byteLength(property));
+
         buffer.write(property, 1 + offset, 'utf8');
         buffer.writeUInt32BE(Number(size), 256 + offset);
-
+        buffer.writeBigUInt64BE(BigInt(next), 260 + offset);
+        
         return {
             type: 5,
             start: start,
             property: properties,
-            size
+            size,
+            next
         };
     }
 }

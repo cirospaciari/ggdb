@@ -1,9 +1,6 @@
 const CURRENT_VERSION = new Uint8Array([0, 0, 1]);
 const HEADER_SIZE = 72;
 
-//https://www.npmjs.com/package/fast-json-stringify
-//https://github.com/chrisdickinson/bops
-
 const fs = require('fs');
 const util = require('util');
 const read = util.promisify(fs.read);
@@ -27,12 +24,14 @@ const Errors = {
     CharsetTooLong: new Error('Charset name too long for header.'),
     FileIsClosed: new Error(`File is closed`)
 }
+//https://www.cs.usfca.edu/~galles/visualization/BTree.html
 
 class File {
 
     constructor(filename, header) {
         this.filename = filename;
         this.write = this.write.bind(this);
+        this.read = this.read.bind(this);
         this.isLoading = true;
         //queue for all writes in file
         this.write_queue = new Synquer();
@@ -68,6 +67,7 @@ class File {
             }
             this.fd = this.IOMode === "async" ? await open(this.filename, 'w+') : fs.openSync(this.filename, "w+");
             this.header = this.header || {};
+            this.header.charset = 'utf8';//partial implemented but abandoned uses default utf8 in some places, i will reimplement this feature in future versions
             await this.createHeader(this.header.charset, this.header.inMemoryPages, this.header.pageSize);
             this.pages = [];
             this.isLoading = false;
@@ -122,7 +122,7 @@ class File {
             charset: charset || 'utf8',
             count: 0n,
             spaceUsed: 0n,
-            inMemoryPages: inMemoryPages || 100,
+            inMemoryPages: typeof inMemoryPages === "number" ? inMemoryPages : 10,
             pageSize: pageSize || 10000,
             nextIndexInfo: 0n,
             nextPageInfo: 0n,
@@ -233,9 +233,6 @@ class File {
         //load in memory most used
         this.loaded_pages = this.loaded_pages || {};
         this.loaded_pages_counter = 0;
-        for (let i = 0; i < this.header.inMemoryPages && i < this.pages.length; i++) {
-            this.loadPage(this.pages[i]);
-        }
 
         //load sequences
         next = this.header.nextSequenceInfo;
@@ -248,15 +245,17 @@ class File {
         }
 
 
-        // this.indexes = []; 
-        // next = this.header.nextIndexInfo;
-        // while (next != 0n) {
-        //     const buffer = Buffer.alloc(269);
-        //     fs.readSync(this.fd, buffer, 0, 269, next);
-        //     const index = IndexEntry.load(buffer, 0, next);
-        //     next = index.next;
-        //     this.indexes.push(index);
-        // }
+        this.indexes = []; 
+        next = this.header.nextIndexInfo;
+        while (next != 0n) {
+            const buffer = IndexEntry.getBuffer();
+            await this.read(buffer, 0, buffer.byteLength, Number(next));
+            const index = IndexEntry.load(buffer, 0, next);
+            index.queue = new Synquer();
+            await IndexEntry.loadBucket(this.read, index);
+            next = index.next;
+            this.indexes.push(index);
+        }
     }
 
     async createSequence(property, options) {
@@ -337,21 +336,6 @@ class File {
         return PageEntry.updateUses(this.write, page);
     }
 
-    async loadPage(page) {
-        this.loaded_pages = this.loaded_pages || {};
-        this.loaded_pages_counter = this.loaded_pages_counter || 0;
-        let buffer = this.loaded_pages[page.number];
-        if (!buffer) {
-            buffer = Buffer.alloc(Number(page.end - page.start));
-            await this.read(buffer, 0, buffer.byteLength, Number(page.start));
-            this.loaded_pages[page.number] = buffer;
-            this.loaded_pages_counter++;
-        }
-
-        page.buffer = buffer;
-        return page;
-    }
-
     async createPage(stats) {
         //no page available create new!
         return await this.page_queue.execute(async () => {
@@ -424,14 +408,12 @@ class File {
                 throw Errors.Corrupted;
 
             let free = null;
-            if (this.loaded_pages[page.number]) {
-                free = FreeEntry.load(this.loaded_pages[page.number], nextFree - page.start);
-            } else {
-                const buffer = FreeEntry.getBuffer();
-                await this.read(buffer, 0, buffer.byteLength, Number(nextFree));
-                free = FreeEntry.load(buffer, 0);
-            }
-            if ((itsTotalSize ? free.totalSize >= size : free.maxDataSize >= size) && (!itsForDataInserting || page.count < this.header.pageSize)) {
+
+            const buffer = FreeEntry.getBuffer();
+            await this.read(buffer, 0, buffer.byteLength, Number(nextFree));
+            free = FreeEntry.load(buffer, 0);
+
+            if ((itsTotalSize ? free.totalSize >= size : free.maxDataSize >= size) && (!itsForDataInserting || Number(page.count) < this.header.pageSize)) {
                 before = last;
                 after = free.next;
                 position = nextFree;
@@ -445,28 +427,12 @@ class File {
         }
         const isEOF = position === stats.size;
 
-        if (!page) {
+        if (!page || (itsForDataInserting && Number(page.count) === this.header.pageSize)) {
             //if its dont find a page create it!
             page = await this.createPage(stats);
         }
         //update file size
         return { page, offset: position - page.start, absolute_offset: position, before, after, isEOF, entry_pre_alloc_size };
-    }
-
-    async bulkAdd(objArray) {
-        if (this.closed)
-            throw Errors.FileIsClosed;
-        if (this.isLoading) {
-            await this.waitLoading();
-        }
-        const start = Date.now();
-        return await this.insert_delete_queue.execute(async () => {
-
-            const end = Date.now();
-            return {
-                timing: end - start,
-            }
-        });
     }
 
     async add(obj) {
@@ -539,12 +505,7 @@ class File {
             //wait writes in disk
             await Promise.all(promises);
 
-            //unload page if its loaded
-            if (this.loaded_pages[position.page.number]) {
-                delete position.page.buffer;
-                delete this.loaded_pages[position.page.number];
-                this.loaded_pages_counter--;
-            }
+
             //search cache
             position.page.loaded_entries = 0;
             delete position.page.entries;
@@ -578,7 +539,7 @@ class File {
                         bucket_entry.hash = hash;
                         //update in buffer
                         IndexEntry.updateEntry(index, bucket_index, bucket_entry);
-                        await this.write(index.buffer, bucket_offset, 20, index.start + IndexEntry.getBufferSize() + bucket_offset);
+                        await this.write(index.buffer, bucket_offset, 20, Number(index.start) + IndexEntry.getBufferSize() + bucket_offset);
                     } else {
                         //create extra entry with the current info
                         const bucket_entry_buffer = IndexEntry.getExtraEntryBuffer();
@@ -591,7 +552,7 @@ class File {
                         IndexEntry.saveExtraEntry(bucket_entry_buffer, 0, bucket_extra_entry);
                         //unload page if its loaded
                         if (position.page.number !== page.number) {
-                            this.cleanPage(position.page, true);
+                            this.cleanPage(position.page);
                         }
                         //write on disk
                         await this.write(bucket_entry_buffer, 0, bucket_entry_buffer.byteLength, Number(position.absolute_offset));
@@ -601,7 +562,7 @@ class File {
                         bucket_entry.page = page.number;
                         bucket_entry.next = Number(position.offset);
                         bucket_entry.nextPage = position.page.number;
-                    
+
                         //expand in memory 
                         position.page.end = BigInt(position.page.end) + BigInt(bucket_entry_buffer.byteLength);
 
@@ -609,7 +570,7 @@ class File {
                         await PageEntry.updateCountAndEnd(this.write, position.page);
 
                         IndexEntry.updateEntry(index, bucket_index, bucket_entry);
-                        await this.write(index.buffer, bucket_offset, 20, index.start + IndexEntry.getBufferSize() + bucket_offset);  
+                        await this.write(index.buffer, bucket_offset, 20, index.start + IndexEntry.getBufferSize() + bucket_offset);
                     }
                 });
 
@@ -667,11 +628,13 @@ class File {
             let stats = await this.fstat({ bigint: true });
             const buffer = IndexEntry.getBuffer();
             //if a page exists just update the page end
-            index = IndexEntry.save(buffer, 0, Number(stats.size) + 1, properties, size * 20);
-            await this.write(buffer, 0, buffer.byteLength, index.start);
+            index = IndexEntry.save(buffer, 0, Number(stats.size) + 1, properties, size * 20, BigInt(this.header.nextIndexInfo));
+            await this.write(buffer, 0, buffer.byteLength, Number(index.start));
             await IndexEntry.createBucket(this.write, index);
             index.queue = new Synquer();//update/insert/delete queue for this index
             this.indexes.push(index);
+            this.header.nextIndexInfo = BigInt(index.start);
+            await this.updateHeaderInfo();
 
             //create another page if need
             if (this.lastPage) {
@@ -683,15 +646,13 @@ class File {
                 //update all indexes!
                 if (this.header.count > 0) {
                     const bucket_size = index.entries.length;
-                    let cleanBuffer = false;
                     let last_page = null;
                     await this.search(() => true, async (data, count, page, buffer, buffer_offset, entry, absolute_position) => {
 
                         if (last_page && last_page.number !== page.number) {
-                            this.cleanPage(last_page, cleanBuffer);
+                            this.cleanPage(last_page);
                         }
                         last_page = page;
-                        cleanBuffer = false;
 
 
                         let hash = 0;
@@ -727,7 +688,7 @@ class File {
                             if (position.page.number === page.number) {
                                 cleanBuffer = true;
                             } else {
-                                this.cleanPage(position.page, cleanBuffer);
+                                this.cleanPage(position.page);
                             }
                             //write on disk
                             await this.write(bucket_entry_buffer, 0, bucket_entry_buffer.byteLength, Number(position.absolute_offset));
@@ -736,7 +697,7 @@ class File {
                             bucket_entry.position = Number(absolute_position) - Number(page.start);
                             bucket_entry.nextPage = position.page.number;
                             bucket_entry.next = Number(position.offset);
-                            
+
                             //expand in memory 
                             position.page.end = BigInt(position.page.end) + BigInt(bucket_entry_buffer.byteLength);
                             //write new page count and end on disk
@@ -749,7 +710,7 @@ class File {
                     });
                     if (last_page) {
                         //remove search cache
-                        this.cleanPage(last_page, cleanBuffer);
+                        this.cleanPage(last_page);
                     }
                     //save indexes!
                     await IndexEntry.saveBucket(this.write, index);
@@ -809,69 +770,47 @@ class File {
             if (bucket_entry.page !== 0 && bucket_entry.hash === hash) {
 
                 let entry = null;
-                
+
                 let page = this.pagesByIndex[bucket_entry.page];
                 page.position_cache = page.position_cache || {};
                 const absolute_position = Number(bucket_entry.position) + Number(page.start);
                 let data = null;
                 let valid = false;
 
-                if (this.loaded_pages[page.number]) {
-                    const inmemory_entry = page.position_cache[bucket_entry.position];
-                    if (inmemory_entry) {
-                        entry = bucket_entry.entry;
-                        data = { ...inmemory_entry.data };
-                        if (match(condition, data)) { //check
-                            valid = await filter(data, count);
-                        }
-                    } else {
-                        const type = this.loaded_pages[page.number].readUInt8(bucket_entry.position);
-                        //if is data type
-                        if (type === 1) {
-                            entry = DataEntry.load(this.loaded_pages[page.number], bucket_entry.position);
 
-                            data = JSON.parse(entry.data);
-                            page.position_cache[bucket_entry.position] = { position: absolute_position, data: { ...data }, next: absolute_position + entry.totalSize, entry };
-                            if (match(condition, data)) { //check
-                                valid = await filter(data, count);
-                            }
-                        }
+                //page its not loaded BUT have some partial position cache
+                page.position_cache = page.position_cache || {};
+                const inmemory_entry = page.position_cache[bucket_entry.position];
+                if (inmemory_entry) {
+                    entry = bucket_entry.entry;
+                    data = { ...inmemory_entry.data };
+                    if (match(condition, data)) { //check
+                        valid = await filter(data, count);
                     }
-
                 } else {
-                    //page its not loaded BUT have some partial position cache
-                    page.position_cache = page.position_cache || {};
-                    const inmemory_entry = page.position_cache[bucket_entry.position];
-                    if (inmemory_entry) {
-                        entry = bucket_entry.entry;
-                        data = { ...inmemory_entry.data };
+                    let buffer = DataEntry.getBuffer(0);
+                    await this.read(buffer, 0, buffer.byteLength, absolute_position);
+                    entry = DataEntry.load(buffer, 0, false);
+                    if (entry.type === 1) {
+                        buffer = DataEntry.getBuffer(entry.size);
+                        await this.read(buffer, 0, buffer.byteLength, absolute_position);
+                        entry = DataEntry.load(buffer, 0, true);
+                        data = JSON.parse(entry.data);
+                        //add partial cache
+                        page.position_cache[bucket_entry.position] = { position: absolute_position, data: { ...data }, next: absolute_position + entry.totalSize, entry };
+
                         if (match(condition, data)) { //check
                             valid = await filter(data, count);
-                        }
-                    } else {
-                        let buffer = DataEntry.getBuffer(0);
-                        await this.read(buffer, 0, buffer.byteLength, absolute_position);
-                        entry = DataEntry.load(buffer, 0, false);
-                        if (entry.type === 1) {
-                            buffer = DataEntry.getBuffer(entry.size);
-                            await this.read(buffer, 0, buffer.byteLength, absolute_position);
-                            entry = DataEntry.load(buffer, 0, true);
-                            data = JSON.parse(entry.data);
-                            //add partial cache
-                            page.position_cache[bucket_entry.position] = { position: absolute_position, data: { ...data }, next: absolute_position + entry.totalSize, entry };
-
-                            if (match(condition, data)) { //check
-                                valid = await filter(data, count);
-                            }
                         }
                     }
                 }
+
 
                 if (valid !== false) {
                     this.updatePageUsage(page);//update page usage
                     count++;
                     const endSearch = await action(typeof valid !== "boolean" ? valid : data, count, page, bucket_entry.position, entry, absolute_position);
-                    if (endSearch){
+                    if (endSearch) {
                         break;
                     }
                 }
@@ -883,14 +822,12 @@ class File {
             }
 
             let page = this.pagesByIndex[bucket_entry.nextPage];
-            if (this.loaded_pages[page.number]) {
-                bucket_entry = IndexEntry.loadExtraEntry(this.loaded_pages[page.number], bucket_entry.next);
-            } else {
-                let buffer = IndexEntry.getExtraEntryBuffer();
-                const absolute_position = Number(bucket_entry.next) + Number(page.start);
-                await this.read(buffer, 0, buffer.byteLength, absolute_position);
-                bucket_entry = IndexEntry.loadExtraEntry(buffer, 0);
-            }
+
+            let buffer = IndexEntry.getExtraEntryBuffer();
+            const absolute_position = Number(bucket_entry.next) + Number(page.start);
+            await this.read(buffer, 0, buffer.byteLength, absolute_position);
+            bucket_entry = IndexEntry.loadExtraEntry(buffer, 0);
+
         }
         //clean loaded pages or load pages to cache if needed
         this.cleanPages();
@@ -954,13 +891,7 @@ class File {
         return results;
     }
 
-    cleanPage(page, cleanBuffer) {
-        //unload page if its loaded
-        if (cleanBuffer && this.loaded_pages[page.number]) {
-            delete page.buffer;
-            delete this.loaded_pages[page.number];
-            this.loaded_pages_counter--;
-        }
+    cleanPage(page) {
         //search cache
         page.loaded_entries = 0;
         delete page.entries;
@@ -974,7 +905,6 @@ class File {
         }
 
         let last_page = null;
-        let cleanBuffer = false;
 
         const search_promises = [];
         await this.search(filter, (data, count, page, buffer, buffer_offset, entry, absolute_position) => {
@@ -985,10 +915,9 @@ class File {
                 const size = Buffer.byteLength(updated_data);
 
                 if (last_page && last_page.number !== page.number) {
-                    this.cleanPage(last_page, cleanBuffer);
+                    this.cleanPage(last_page);
                 }
                 last_page = page;
-                cleanBuffer = false;
 
                 if (size <= entry.maxDataSize) {
                     //data fit just update
@@ -1027,10 +956,8 @@ class File {
                         }
                         promises.push(this.updatePageUsage(position.page));
                         //unload page if its loaded
-                        if (position.page.number === page.number) {
-                            cleanBuffer = true;
-                        } else {
-                            this.cleanPage(position.page, cleanBuffer);
+                        if (position.page.number !== page.number) {
+                            this.cleanPage(position.page);
                         }
 
                         const entryHeaderSize = FreeEntry.getBufferSize();
@@ -1060,7 +987,7 @@ class File {
         await Promise.all(search_promises);
         if (last_page) {
             //remove search cache
-            this.cleanPage(last_page, cleanBuffer);
+            this.cleanPage(last_page);
         }
         return search_promises.length;
     }
@@ -1188,19 +1115,11 @@ class File {
     }
 
     cleanPages() {
-
         //clean extra loaded pages by usage
-        this.pages.sort(sortByMostUsedOrLast).forEach((p, index) => {
+        this.pages.sort(sortByMostUsedOrLast).forEach((page, index) => {
             if (index >= this.header.inMemoryPages) {
                 //clear buffers
-                delete p.buffer;
-                p.loaded_entries = 0;
-                delete p.entries;
-                delete p.position_cache;
-                delete this.loaded_pages[p.number];
-                this.loaded_pages_counter = this.header.inMemoryPages;
-            } else if (!p.buffer) { //page its not loaded, but its most used!
-                this.loadPage(p);//so load the page!
+                this.cleanPage(page);
             }
 
         });
@@ -1226,12 +1145,11 @@ class File {
         const pages = this.pages.slice(0);
         //TODO: usar add-on c++ para processamento dos buffers com multi-threading
         //https://community.risingstack.com/using-buffers-node-js-c-plus-plus/
-
         for (let i = 0; i < pages.length; i++) {
+
             let page = pages[i];
             let position = Number(page.start);
 
-            page = await this.loadPage(page);
             let lastCount = count;
             if (page.count === 0)
                 continue;
@@ -1269,16 +1187,25 @@ class File {
                 }
             }
 
+
+            const space_needed = Number(page.end) - Number(position);
+            const buffer_start = position;
+            this.shared_buffer = this.shared_buffer && this.shared_buffer.byteLength >= space_needed ? this.shared_buffer.fill(0, 0, space_needed) : Buffer.alloc(space_needed);
+            await this.read(this.shared_buffer, 0, space_needed, Number(page.start));
+            const buffer = this.shared_buffer;
+
+
             dataEntryCount = page.loaded_entries;
             // this is needed to clean pages in async without lose pages info and buffer in use
-            const buffer = page.buffer;
-            while (position <= page.end && !endSearch) {
+            while (position < page.end && !endSearch) {
 
-                let buffer_offset = position - Number(page.start);
+                const page_offset = position - Number(page.start);
+                const buffer_offset = position - buffer_start;
+
                 if (buffer.byteLength <= buffer_offset)
                     break;
-                let absolute_position = position;
-                let type = buffer.readUInt8(buffer_offset);
+                const absolute_position = position;
+                const type = buffer.readUInt8(buffer_offset);
                 let data = null;
                 let entry = null;
                 switch (type) {
@@ -1288,24 +1215,30 @@ class File {
                         if (data) {
                             data = { ...data.data };
                             position = data.next;
+                            entry = data.entry;
                         } else {
-                            data = page.position_cache[buffer_offset];
+                            data = page.position_cache[page_offset];
                             page.entries[dataEntryCount] = data;
                             if (data) {
                                 data = { ...data.data };
                                 position = data.next;
+                                entry = data.entry;
                             } else {
                                 entry = DataEntry.load(buffer, buffer_offset);
                                 data = JSON.parse(entry.data);
+                                entry.data = null;
+                                delete entry.data;
                                 position += entry.totalSize;
-                                const inmemory_entry = { position: absolute_position, data, next: position, entry };
+
+                                const inmemory_entry = { position: Number(absolute_position), data, next: Number(position), entry };
                                 page.entries[dataEntryCount] = inmemory_entry;
-                                page.position_cache[buffer_offset] = inmemory_entry;
+                                page.position_cache[page_offset] = inmemory_entry;
+
+                                inmemory_entry.entry.data = null;
                                 delete inmemory_entry.entry.data;
                                 page.loaded_entries++;
                             }
                         }
-
                         dataEntryCount++;
                         break;
                     //FreeEntry
@@ -1326,6 +1259,9 @@ class File {
                     case 7: //ignore
                         position += SequenceEntry.getBufferSize();
                         continue;
+                    default:
+                        throw new Error('Invalid entry type at ' + position);
+
                 }
 
                 const valid = await filter(data, count);
@@ -1355,8 +1291,9 @@ class File {
         await Promise.all([
             this.update_queue.wait(),
             this.insert_delete_queue.wait(),
+            Promise.all(this.indexes.map(index=> index.queue.wait())),
             this.page_queue.wait(),
-            this.write_queue.wait()
+            this.write_queue.wait(),
         ]);
         //dispose
         this.pages.forEach((p) => {
